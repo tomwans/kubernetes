@@ -450,14 +450,14 @@ func (m *kubeGenericRuntimeManager) computePodActions(pod *v1.Pod, podStatus *ku
 		ContainersToKill:  make(map[kubecontainer.ContainerID]containerToKillInfo),
 	}
 
-	sidecarContainers := make(map[int]bool)
+	sidecarIndexes := make(map[int]bool)
 	for idx, container := range pod.Spec.Containers {
 		if pod.Labels[fmt.Sprintf("lyft.net/%s-tag", container.Name)] != "" {
-			sidecarContainers[idx] = true
+			sidecarIndexes[idx] = true
 		}
 	}
 
-	glog.Infof("Pod %s/%s sidecars: %s", pod.Namespace, pod.Name, sidecarContainers)
+	glog.Infof("Pod %s/%s sidecars: %s", pod.Namespace, pod.Name, sidecarIndexes)
 
 	// If we need to (re-)create the pod sandbox, everything will need to be
 	// killed and recreated, and init containers should be purged.
@@ -474,7 +474,7 @@ func (m *kubeGenericRuntimeManager) computePodActions(pod *v1.Pod, podStatus *ku
 		// Start all containers by default but exclude the ones that succeeded if
 		// RestartPolicy is OnFailure, or they are non-sidecars.
 		for idx, c := range pod.Spec.Containers {
-			if (containerSucceeded(&c, podStatus) && pod.Spec.RestartPolicy == v1.RestartPolicyOnFailure) || !sidecarContainers[idx] {
+			if (containerSucceeded(&c, podStatus) && pod.Spec.RestartPolicy == v1.RestartPolicyOnFailure) || !sidecarIndexes[idx] {
 				continue
 			}
 			changes.ContainersToStart = append(changes.ContainersToStart, idx)
@@ -498,36 +498,31 @@ func (m *kubeGenericRuntimeManager) computePodActions(pod *v1.Pod, podStatus *ku
 		return changes
 	}
 
-	// wait until the sidecars are up
-	sidecarsAlive := make(map[int]bool)
-	for idx := range sidecarContainers {
-		sidecarsAlive[idx] = false
-		containerStatus := podStatus.FindContainerStatusByName(pod.Spec.Containers[idx].Name)
-		// TODO: should we use readiness or liveness checks?
-		if containerStatus.State == kubecontainer.ContainerStateRunning {
-			//liveness, found := m.livenessManager.Get(containerStatus.ID)
-			//if found && liveness == proberesults.Success {
-			sidecarsAlive[idx] = true
-			//}
-			glog.Infof("Pod %s/%s sidecar %d status: %s", pod.Namespace, pod.Name, idx, sidecarsAlive[idx])
+	// wait until the sidecars are ready
+	sidecarsReady := true
+	for idx := range sidecarIndexes {
+		container := pod.Spec.Containers[idx]
+		containerStatus := podStatus.FindContainerStatusByName(container.Name)
+		if containerStatus != nil && containerStatus.State == kubecontainer.ContainerStateRunning {
+			for _, status := range pod.Status.ContainerStatuses {
+				if status.ContainerID == containerStatus.ID.ID {
+					if !status.Ready {
+						sidecarsReady = false
+						glog.Infof("Pod %s/%s sidecar %d (%s) is not ready", pod.Namespace, pod.Name, idx, container.Name)
+					}
+				}
+			}
+		} else {
+			sidecarsReady = false
+			glog.Infof("Pod %s/%s sidecar %d (%s) is not running", pod.Namespace, pod.Name, idx, container.Name)
 		}
 	}
-
-	areSidecarsAlive := true
-	for _, alive := range sidecarsAlive {
-		if !alive {
-			areSidecarsAlive = false
-			break
-		}
-	}
-
-	glog.Infof("Pod %s/%s sidecars living status: %s, Final: %s", pod.Namespace, pod.Name, sidecarsAlive, areSidecarsAlive)
 
 	// Number of running containers to keep.
 	keepCount := 0
 	// check the status of containers.
 	for idx, container := range pod.Spec.Containers {
-		isSidecar := sidecarContainers[idx]
+		isSidecar := sidecarIndexes[idx]
 		containerStatus := podStatus.FindContainerStatusByName(container.Name)
 
 		// Call internal container post-stop lifecycle hook for any non-running container so that any
@@ -543,8 +538,8 @@ func (m *kubeGenericRuntimeManager) computePodActions(pod *v1.Pod, podStatus *ku
 		// If container does not exist, or is not running, check whether we
 		// need to restart it.
 		if containerStatus == nil || containerStatus.State != kubecontainer.ContainerStateRunning {
-			if !isSidecar && !areSidecarsAlive {
-				glog.Infof("Container %+v is dead, but we won't start it because its a non-sidecar and they are not alive yet", container)
+			if !isSidecar && !sidecarsReady {
+				glog.Infof("Container %+v is dead, but we won't start it because its a non-sidecar and sidecars are not ready yet", container)
 				continue
 			}
 			if kubecontainer.ShouldContainerBeRestarted(&container, pod, podStatus) {
