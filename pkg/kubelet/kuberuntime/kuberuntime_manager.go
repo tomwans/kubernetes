@@ -436,6 +436,10 @@ func containerSucceeded(c *v1.Container, podStatus *kubecontainer.PodStatus) boo
 	return cStatus.ExitCode == 0
 }
 
+func isSidecar(pod *v1.Pod, container v1.Container) bool {
+	return pod.Labels[fmt.Sprintf("lyft.net/%s-tag", container.Name)] != ""
+}
+
 // computePodActions checks whether the pod spec has changed and returns the changes if true.
 func (m *kubeGenericRuntimeManager) computePodActions(pod *v1.Pod, podStatus *kubecontainer.PodStatus) podActions {
 	glog.V(5).Infof("Syncing Pod %q: %+v", format.Pod(pod), pod)
@@ -450,14 +454,14 @@ func (m *kubeGenericRuntimeManager) computePodActions(pod *v1.Pod, podStatus *ku
 		ContainersToKill:  make(map[kubecontainer.ContainerID]containerToKillInfo),
 	}
 
-	sidecarIndexes := make(map[int]bool)
+	var sidecarNames []string
 	for idx, container := range pod.Spec.Containers {
-		if pod.Labels[fmt.Sprintf("lyft.net/%s-tag", container.Name)] != "" {
-			sidecarIndexes[idx] = true
+		if isSidecar(pod, container) {
+			sidecarNames = append(sidecarNames, container.Name)
 		}
 	}
 
-	glog.Infof("Pod %s/%s sidecars: %s", pod.Namespace, pod.Name, sidecarIndexes)
+	glog.Infof("Pod %s/%s sidecars: %s", pod.Namespace, pod.Name, sidecarNames)
 
 	// If we need to (re-)create the pod sandbox, everything will need to be
 	// killed and recreated, and init containers should be purged.
@@ -474,7 +478,7 @@ func (m *kubeGenericRuntimeManager) computePodActions(pod *v1.Pod, podStatus *ku
 		// Start all containers by default but exclude the ones that succeeded if
 		// RestartPolicy is OnFailure, or they are non-sidecars.
 		for idx, c := range pod.Spec.Containers {
-			if (containerSucceeded(&c, podStatus) && pod.Spec.RestartPolicy == v1.RestartPolicyOnFailure) || !sidecarIndexes[idx] {
+			if (containerSucceeded(&c, podStatus) && pod.Spec.RestartPolicy == v1.RestartPolicyOnFailure) || !isSidecar(pod, c) {
 				continue
 			}
 			changes.ContainersToStart = append(changes.ContainersToStart, idx)
@@ -500,8 +504,11 @@ func (m *kubeGenericRuntimeManager) computePodActions(pod *v1.Pod, podStatus *ku
 
 	// wait until the sidecars are ready
 	sidecarsReady := true
-	for idx := range sidecarIndexes {
-		container := pod.Spec.Containers[idx]
+	for idx, container := range pod.Spec.Containers {
+		if !isSidecar(pod, container) {
+			continue
+		}
+
 		containerStatus := podStatus.FindContainerStatusByName(container.Name)
 		if containerStatus != nil && containerStatus.State == kubecontainer.ContainerStateRunning {
 			for _, status := range pod.Status.ContainerStatuses {
@@ -522,7 +529,6 @@ func (m *kubeGenericRuntimeManager) computePodActions(pod *v1.Pod, podStatus *ku
 	keepCount := 0
 	// check the status of containers.
 	for idx, container := range pod.Spec.Containers {
-		isSidecar := sidecarIndexes[idx]
 		containerStatus := podStatus.FindContainerStatusByName(container.Name)
 
 		// Call internal container post-stop lifecycle hook for any non-running container so that any
@@ -538,7 +544,7 @@ func (m *kubeGenericRuntimeManager) computePodActions(pod *v1.Pod, podStatus *ku
 		// If container does not exist, or is not running, check whether we
 		// need to restart it.
 		if containerStatus == nil || containerStatus.State != kubecontainer.ContainerStateRunning {
-			if !isSidecar && !sidecarsReady {
+			if !isSidecar(pod, container) && !sidecarsReady {
 				glog.Infof("Container %+v is dead, but we won't start it because its a non-sidecar and sidecars are not ready yet", container)
 				continue
 			}

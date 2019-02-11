@@ -504,8 +504,8 @@ func (m *kubeGenericRuntimeManager) restoreSpecsFromContainerLabels(containerID 
 		},
 	}
 	container = &v1.Container{
-		Name:  l.ContainerName,
-		Ports: a.ContainerPorts,
+		Name:                   l.ContainerName,
+		Ports:                  a.ContainerPorts,
 		TerminationMessagePath: a.TerminationMessagePath,
 	}
 	if a.PreStopHandler != nil {
@@ -581,17 +581,14 @@ func (m *kubeGenericRuntimeManager) killContainer(pod *v1.Pod, containerID kubec
 	return err
 }
 
-// killContainersWithSyncResult kills all pod's containers with sync results.
-func (m *kubeGenericRuntimeManager) killContainersWithSyncResult(pod *v1.Pod, runningPod kubecontainer.Pod, gracePeriodOverride *int64) (syncResults []*kubecontainer.SyncResult) {
-	containerResults := make(chan *kubecontainer.SyncResult, len(runningPod.Containers))
+func (m *kubeGenericRuntimeManager) killContainersInParallelWithSyncResult(pod *v1.Pod, containers []*kubecontainer.Container, gracePeriodOverride *int64) (syncResults []*kubecontainer.SyncResult) {
+	containerResults := make(chan *kubecontainer.SyncResult, len(containers))
 	wg := sync.WaitGroup{}
-
-	wg.Add(len(runningPod.Containers))
-	for _, container := range runningPod.Containers {
+	wg.Add(len(containers))
+	for _, container := range containers {
 		go func(container *kubecontainer.Container) {
 			defer utilruntime.HandleCrash()
 			defer wg.Done()
-
 			killContainerResult := kubecontainer.NewSyncResult(kubecontainer.KillContainer, container.Name)
 			if err := m.killContainer(pod, container.ID, container.Name, "Need to kill Pod", gracePeriodOverride); err != nil {
 				killContainerResult.Fail(kubecontainer.ErrKillContainer, err.Error())
@@ -601,10 +598,57 @@ func (m *kubeGenericRuntimeManager) killContainersWithSyncResult(pod *v1.Pod, ru
 	}
 	wg.Wait()
 	close(containerResults)
-
 	for containerResult := range containerResults {
 		syncResults = append(syncResults, containerResult)
 	}
+	return
+}
+
+// killContainersWithSyncResult kills all pod's containers with sync results.
+func (m *kubeGenericRuntimeManager) killContainersWithSyncResult(pod *v1.Pod, runningPod kubecontainer.Pod, gracePeriodOverride *int64) (syncResults []*kubecontainer.SyncResult) {
+	var nonSidecarContainers []*kubecontainer.Container
+	var sidecarContainers []*kubecontainer.Container
+	for _, container := range runningPod.Containers {
+		containerSpec := kubecontainer.GetContainerSpec(pod, container.Name)
+		if !isSidecar(pod, containerSpec) {
+			nonSidecarContainers = append(nonSidecarContainers, container)
+		} else {
+			sidecarContainers = append(sidecarContainers, container)
+		}
+	}
+
+	results := m.killContainersInParallelWithSyncResult(pod, nonSidecarContainers, gracePeriodOverride)
+	syncResults = append(syncResults, results...)
+
+	glog.Infof("non-sidecars killed, killing sidecars now")
+
+	// wait until non-sidecars are terminated
+	sidecarsTerminated := false
+	for !sidecarsTerminated {
+		sidecarsTerminatedInner := true
+		for _, c := range sidecarContainers {
+			status, err := m.runtimeService.ContainerStatus(c.ID.ID)
+			if err != nil {
+				glog.Errorf("ContainerStatus for %s error: %v", c.ID.ID, err)
+				sidecarsTerminatedInner = false
+				break
+			}
+			if status.State != runtimeapi.ContainerState_CONTAINER_EXITED {
+				sidecarsTerminatedInner = false
+				break
+			}
+		}
+		if sidecarsTerminatedInner {
+			sidecarsTerminated = true
+		} else {
+			time.Sleep(1 * time.Second)
+		}
+	}
+
+	// now we drop the sidecars.
+	results = m.killContainersInParallelWithSyncResult(pod, sidecarContainers, gracePeriodOverride)
+	syncResults = append(syncResults, results...)
+
 	return
 }
 
