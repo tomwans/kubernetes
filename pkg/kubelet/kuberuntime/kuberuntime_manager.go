@@ -5,7 +5,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    http://www.apache.org/licenses/LICENSE-2.0
+	http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -447,8 +447,8 @@ func containerSucceeded(c *v1.Container, podStatus *kubecontainer.PodStatus) boo
 	return cStatus.ExitCode == 0
 }
 
-func isSidecar(pod *v1.Pod, container v1.Container) bool {
-	return pod.Labels[fmt.Sprintf("lyft.net/%s-tag", container.Name)] != ""
+func isSidecar(pod *v1.Pod, containerName string) bool {
+	return pod.Labels[fmt.Sprintf("lyft.net/%s-tag", containerName)] != ""
 }
 
 // computePodActions checks whether the pod spec has changed and returns the changes if true.
@@ -467,7 +467,7 @@ func (m *kubeGenericRuntimeManager) computePodActions(pod *v1.Pod, podStatus *ku
 
 	var sidecarNames []string
 	for _, container := range pod.Spec.Containers {
-		if isSidecar(pod, container) {
+		if isSidecar(pod, container.Name) {
 			sidecarNames = append(sidecarNames, container.Name)
 		}
 	}
@@ -489,7 +489,7 @@ func (m *kubeGenericRuntimeManager) computePodActions(pod *v1.Pod, podStatus *ku
 		// Start all containers by default but exclude the ones that succeeded if
 		// RestartPolicy is OnFailure, or they are non-sidecars.
 		for idx, c := range pod.Spec.Containers {
-			if (containerSucceeded(&c, podStatus) && pod.Spec.RestartPolicy == v1.RestartPolicyOnFailure) || !isSidecar(pod, c) {
+			if (containerSucceeded(&c, podStatus) && pod.Spec.RestartPolicy == v1.RestartPolicyOnFailure) || !isSidecar(pod, c.Name) {
 				continue
 			}
 			changes.ContainersToStart = append(changes.ContainersToStart, idx)
@@ -516,7 +516,7 @@ func (m *kubeGenericRuntimeManager) computePodActions(pod *v1.Pod, podStatus *ku
 	// wait until the sidecars are ready
 	sidecarsReady := true
 	for idx, container := range pod.Spec.Containers {
-		if !isSidecar(pod, container) {
+		if !isSidecar(pod, container.Name) {
 			continue
 		}
 
@@ -555,7 +555,7 @@ func (m *kubeGenericRuntimeManager) computePodActions(pod *v1.Pod, podStatus *ku
 		// If container does not exist, or is not running, check whether we
 		// need to restart it.
 		if containerStatus == nil || containerStatus.State != kubecontainer.ContainerStateRunning {
-			if !isSidecar(pod, container) && !sidecarsReady {
+			if !isSidecar(pod, container.Name) && !sidecarsReady {
 				glog.Infof("Container %+v is dead, but we won't start it because its a non-sidecar and sidecars are not ready yet", container)
 				continue
 			}
@@ -655,7 +655,7 @@ func (m *kubeGenericRuntimeManager) SyncPod(pod *v1.Pod, _ v1.PodStatus, podStat
 			glog.V(3).Infof("Killing unwanted container %q(id=%q) for pod %q", containerInfo.name, containerID, format.Pod(pod))
 			killContainerResult := kubecontainer.NewSyncResult(kubecontainer.KillContainer, containerInfo.name)
 			result.AddSyncResult(killContainerResult)
-			if err := m.killContainer(pod, containerID, containerInfo.name, containerInfo.message, nil); err != nil {
+			if err := m.killContainer(pod, containerID, containerInfo.name, containerInfo.message, nil, 10*time.Second); err != nil {
 				killContainerResult.Fail(kubecontainer.ErrKillContainer, err.Error())
 				glog.Errorf("killContainer %q(id=%q) for pod %q failed: %v", containerInfo.name, containerID, format.Pod(pod), err)
 				return

@@ -5,7 +5,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    http://www.apache.org/licenses/LICENSE-2.0
+	http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -35,11 +35,12 @@ import (
 	"github.com/armon/circbuf"
 	"github.com/golang/glog"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	kubetypes "k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/klog"
 	runtimeapi "k8s.io/kubernetes/pkg/kubelet/apis/cri/runtime/v1alpha2"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
 	"k8s.io/kubernetes/pkg/kubelet/events"
@@ -172,7 +173,7 @@ func (m *kubeGenericRuntimeManager) startContainer(podSandboxID string, podSandb
 		msg, handlerErr := m.runner.Run(kubeContainerID, pod, container, container.Lifecycle.PostStart)
 		if handlerErr != nil {
 			m.recordContainerEvent(pod, container, kubeContainerID.ID, v1.EventTypeWarning, events.FailedPostStartHook, msg)
-			if err := m.killContainer(pod, kubeContainerID, container.Name, "FailedPostStartHook", nil); err != nil {
+			if err := m.killContainer(pod, kubeContainerID, container.Name, "FailedPostStartHook", nil, 10*time.Second); err != nil {
 				glog.Errorf("Failed to kill container %q(id=%q) in pod %q: %v, %v",
 					container.Name, kubeContainerID.String(), format.Pod(pod), ErrPostStartHook, err)
 			}
@@ -512,8 +513,8 @@ func (m *kubeGenericRuntimeManager) restoreSpecsFromContainerLabels(containerID 
 		},
 	}
 	container = &v1.Container{
-		Name:  l.ContainerName,
-		Ports: a.ContainerPorts,
+		Name:                   l.ContainerName,
+		Ports:                  a.ContainerPorts,
 		TerminationMessagePath: a.TerminationMessagePath,
 	}
 	if a.PreStopHandler != nil {
@@ -527,7 +528,7 @@ func (m *kubeGenericRuntimeManager) restoreSpecsFromContainerLabels(containerID 
 // killContainer kills a container through the following steps:
 // * Run the pre-stop lifecycle hooks (if applicable).
 // * Stop the container.
-func (m *kubeGenericRuntimeManager) killContainer(pod *v1.Pod, containerID kubecontainer.ContainerID, containerName string, reason string, gracePeriodOverride *int64) error {
+func (m *kubeGenericRuntimeManager) killContainer(pod *v1.Pod, containerID kubecontainer.ContainerID, containerName string, reason string, gracePeriodOverride *int64, terminationPeriod time.Duration) error {
 	var containerSpec *v1.Container
 	if pod != nil {
 		if containerSpec = kubecontainer.GetContainerSpec(pod, containerName); containerSpec == nil {
@@ -543,21 +544,13 @@ func (m *kubeGenericRuntimeManager) killContainer(pod *v1.Pod, containerID kubec
 		pod, containerSpec = restoredPod, restoredContainer
 	}
 
-	// From this point , pod and container must be non-nil.
-	gracePeriod := int64(minimumGracePeriodInSeconds)
-	switch {
-	case pod.DeletionGracePeriodSeconds != nil:
-		gracePeriod = *pod.DeletionGracePeriodSeconds
-	case pod.Spec.TerminationGracePeriodSeconds != nil:
-		gracePeriod = *pod.Spec.TerminationGracePeriodSeconds
-	}
-
-	glog.V(2).Infof("Killing container %q with %d second grace period", containerID.String(), gracePeriod)
-
 	// Run internal pre-stop lifecycle hook
 	if err := m.internalLifecycle.PreStopContainer(containerID.ID); err != nil {
 		return err
 	}
+
+	gracePeriod := int64(terminationPeriod.Seconds())
+	klog.V(2).Infof("Killing container %q with %d second grace period", containerID.String(), gracePeriod)
 
 	// Run the pre-stop lifecycle hooks if applicable and if there is enough time to run it
 	if containerSpec.Lifecycle != nil && containerSpec.Lifecycle.PreStop != nil && gracePeriod > 0 {
@@ -592,22 +585,72 @@ func (m *kubeGenericRuntimeManager) killContainer(pod *v1.Pod, containerID kubec
 // killContainersWithSyncResult kills all pod's containers with sync results.
 func (m *kubeGenericRuntimeManager) killContainersWithSyncResult(pod *v1.Pod, runningPod kubecontainer.Pod, gracePeriodOverride *int64) (syncResults []*kubecontainer.SyncResult) {
 	containerResults := make(chan *kubecontainer.SyncResult, len(runningPod.Containers))
-	wg := sync.WaitGroup{}
 
-	wg.Add(len(runningPod.Containers))
+	// split out sidecars and non-sidecars
+	var (
+		sidecars    []*kubecontainer.Container
+		nonSidecars []*kubecontainer.Container
+	)
 	for _, container := range runningPod.Containers {
+		if isSidecar(pod, container.Name) {
+			sidecars = append(sidecars, container)
+		} else {
+			nonSidecars = append(nonSidecars, container)
+		}
+	}
+
+	// From this point , pod and container must be non-nil.
+	gracePeriod := int64(minimumGracePeriodInSeconds)
+	switch {
+	case pod.DeletionGracePeriodSeconds != nil:
+		gracePeriod = *pod.DeletionGracePeriodSeconds
+	case pod.Spec.TerminationGracePeriodSeconds != nil:
+		gracePeriod = *pod.Spec.TerminationGracePeriodSeconds
+	}
+
+	if gracePeriodOverride != nil {
+		gracePeriod = *gracePeriodOverride
+	}
+
+	gracePeriodDuration := time.Duration(gracePeriod) * time.Second
+
+	// non-sidecars first
+	start := time.Now()
+	klog.Infof("Pod: %s, killing non-sidecars, %s termination period", pod.Name, gracePeriodDuration)
+	nonSidecarsWg := sync.WaitGroup{}
+	nonSidecarsWg.Add(len(nonSidecars))
+	for _, container := range nonSidecars {
+		go func(container *kubecontainer.Container) {
+			defer utilruntime.HandleCrash()
+			defer nonSidecarsWg.Done()
+			killContainerResult := kubecontainer.NewSyncResult(kubecontainer.KillContainer, container.Name)
+			if err := m.killContainer(pod, container.ID, container.Name, "Need to kill Pod", gracePeriodOverride, gracePeriodDuration); err != nil {
+				killContainerResult.Fail(kubecontainer.ErrKillContainer, err.Error())
+			}
+			containerResults <- killContainerResult
+		}(container)
+	}
+	nonSidecarsWg.Wait()
+
+	gracePeriodDuration = gracePeriodDuration - time.Since(start)
+
+	// then sidecars
+	klog.Infof("Pod: %s, killing sidecars, %s left", pod.Name, gracePeriodDuration)
+	wg := sync.WaitGroup{}
+	wg.Add(len(sidecars))
+	for _, container := range sidecars {
 		go func(container *kubecontainer.Container) {
 			defer utilruntime.HandleCrash()
 			defer wg.Done()
-
 			killContainerResult := kubecontainer.NewSyncResult(kubecontainer.KillContainer, container.Name)
-			if err := m.killContainer(pod, container.ID, container.Name, "Need to kill Pod", gracePeriodOverride); err != nil {
+			if err := m.killContainer(pod, container.ID, container.Name, "Need to kill Pod", gracePeriodOverride, gracePeriodDuration); err != nil {
 				killContainerResult.Fail(kubecontainer.ErrKillContainer, err.Error())
 			}
 			containerResults <- killContainerResult
 		}(container)
 	}
 	wg.Wait()
+
 	close(containerResults)
 
 	for containerResult := range containerResults {
