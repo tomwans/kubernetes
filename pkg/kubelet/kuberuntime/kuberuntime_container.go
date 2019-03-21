@@ -40,7 +40,6 @@ import (
 	kubetypes "k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/sets"
-	"k8s.io/klog"
 	runtimeapi "k8s.io/kubernetes/pkg/kubelet/apis/cri/runtime/v1alpha2"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
 	"k8s.io/kubernetes/pkg/kubelet/events"
@@ -550,7 +549,7 @@ func (m *kubeGenericRuntimeManager) killContainer(pod *v1.Pod, containerID kubec
 	}
 
 	gracePeriod := int64(terminationPeriod.Seconds())
-	klog.V(2).Infof("Killing container %q with %d second grace period", containerID.String(), gracePeriod)
+	glog.V(2).Infof("Killing container %q with %d second grace period", containerID.String(), gracePeriod)
 
 	// Run the pre-stop lifecycle hooks if applicable and if there is enough time to run it
 	if containerSpec.Lifecycle != nil && containerSpec.Lifecycle.PreStop != nil && gracePeriod > 0 {
@@ -616,7 +615,7 @@ func (m *kubeGenericRuntimeManager) killContainersWithSyncResult(pod *v1.Pod, ru
 
 	// non-sidecars first
 	start := time.Now()
-	klog.Infof("Pod: %s, killing non-sidecars, %s termination period", pod.Name, gracePeriodDuration)
+	glog.Infof("Pod: %s, killing non-sidecars, %s termination period", pod.Name, gracePeriodDuration)
 	nonSidecarsWg := sync.WaitGroup{}
 	nonSidecarsWg.Add(len(nonSidecars))
 	for _, container := range nonSidecars {
@@ -635,7 +634,7 @@ func (m *kubeGenericRuntimeManager) killContainersWithSyncResult(pod *v1.Pod, ru
 	gracePeriodDuration = gracePeriodDuration - time.Since(start)
 
 	// then sidecars
-	klog.Infof("Pod: %s, killing sidecars, %s left", pod.Name, gracePeriodDuration)
+	glog.Infof("Pod: %s, killing sidecars, %s left", pod.Name, gracePeriodDuration)
 	wg := sync.WaitGroup{}
 	wg.Add(len(sidecars))
 	for _, container := range sidecars {
