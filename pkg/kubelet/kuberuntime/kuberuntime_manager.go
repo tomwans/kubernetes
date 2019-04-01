@@ -604,6 +604,36 @@ func (m *kubeGenericRuntimeManager) computePodActions(pod *v1.Pod, podStatus *ku
 		changes.KillPod = true
 	}
 
+	if pod.Spec.RestartPolicy != v1.RestartPolicyAlways {
+		// Determine if there are any non sidecar containers that are running or need restarting
+		// if there are none, we can kill the remaining sidecars
+		onlySidecars := true
+		for _, container := range pod.Spec.Containers {
+			containerStatus := podStatus.FindContainerStatusByName(container.Name)
+			if !isSidecar(pod, container.Name) && (kubecontainer.ShouldContainerBeRestarted(&container, pod, podStatus) || containerStatus.State == kubecontainer.ContainerStateRunning) {
+				onlySidecars = false
+				break
+			}
+		}
+
+		// only sidecars are left so terminate them all
+		if onlySidecars {
+			for idx, container := range pod.Spec.Containers {
+				containerStatus := podStatus.FindContainerStatusByName(container.Name)
+				// we don't need to terminate non sidecars or exited sidecars
+				if isSidecar(pod, container.Name) && containerStatus.State == kubecontainer.ContainerStateRunning {
+					message := " All containers have permanently exited, sidecar container will be killed"
+					changes.ContainersToKill[containerStatus.ID] = containerToKillInfo{
+						name:      containerStatus.Name,
+						container: &pod.Spec.Containers[idx],
+						message:   message,
+					}
+					glog.V(2).Infof("Container %q (%q) of pod, is sidecar %s: %s", container.Name, containerStatus.ID, format.Pod(pod), message)
+				}
+			}
+		}
+	}
+
 	return changes
 }
 
