@@ -858,12 +858,39 @@ func (m *kubeGenericRuntimeManager) doBackOff(pod *v1.Pod, container *v1.Contain
 // only hard kill paths are allowed to specify a gracePeriodOverride in the kubelet in order to not corrupt user data.
 // it is useful when doing SIGKILL for hard eviction scenarios, or max grace period during soft eviction scenarios.
 func (m *kubeGenericRuntimeManager) KillPod(pod *v1.Pod, runningPod kubecontainer.Pod, gracePeriodOverride *int64) error {
+	if pod == nil {
+		// Restore necessary information if the pod spec is nil. this
+		// is possible when the kubelet has just restarted.
+		//
+		// We pick the first container in the podspec so we can
+		// restore the whole Pod.
+		var (
+			err         error
+			restoredPod *v1.Pod
+		)
+		// we try every container to see if we can recreated our pod
+		// information. if it works fine, we break out.
+		for _, container := range runningPod.Containers {
+			restoredPod, _, err = m.restoreSpecsFromContainerLabels(container.ID)
+			if err == nil {
+				glog.Infof("KillPod: pod %s/%s was nil, restored from %s", runningPod.Namespace, runningPod.Name, container.ID)
+				break
+			} else {
+				glog.Errorf("KillPod: pod %s/%s was nil, tried to restore from %s, got error: %s", runningPod.Namespace, runningPod.Name, container.ID, err)
+			}
+		}
+		// if we encountered an error while trying each container, we return
+		if err != nil {
+			return err
+		}
+		pod = restoredPod
+	}
 	err := m.killPodWithSyncResult(pod, runningPod, gracePeriodOverride)
 	return err.Error()
 }
 
 // killPodWithSyncResult kills a runningPod and returns SyncResult.
-// Note: The pod passed in could be *nil* when kubelet restarted.
+// Note: The pod passed in could be a restored pod (not all fields are set) when kubelet restarted.
 func (m *kubeGenericRuntimeManager) killPodWithSyncResult(pod *v1.Pod, runningPod kubecontainer.Pod, gracePeriodOverride *int64) (result kubecontainer.PodSyncResult) {
 	killContainerResults := m.killContainersWithSyncResult(pod, runningPod, gracePeriodOverride)
 	for _, containerResult := range killContainerResults {
