@@ -874,17 +874,18 @@ func (m *kubeGenericRuntimeManager) KillPod(pod *v1.Pod, runningPod kubecontaine
 		}
 	}
 
-	if gracePeriodOverride == nil {
+	if gracePeriodOverride == nil && pod != nil {
 		switch {
 		case pod.DeletionGracePeriodSeconds != nil:
 			gracePeriodOverride = pod.DeletionGracePeriodSeconds
 		case pod.Spec.TerminationGracePeriodSeconds != nil:
 			gracePeriodOverride = pod.Spec.TerminationGracePeriodSeconds
 		}
-		if gracePeriodOverride == nil {
-			min := int64(minimumGracePeriodInSeconds)
-			gracePeriodOverride = &min
-		}
+	}
+
+	if gracePeriodOverride == nil {
+		min := int64(minimumGracePeriodInSeconds)
+		gracePeriodOverride = &min
 	}
 
 	err := m.killPodWithSyncResult(pod, runningPod, gracePeriodOverride)
