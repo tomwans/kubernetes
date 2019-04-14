@@ -883,7 +883,7 @@ func (m *kubeGenericRuntimeManager) KillPod(pod *v1.Pod, runningPod kubecontaine
 		}
 	}
 
-	if gracePeriodOverride == nil {
+	if gracePeriodOverride == nil || *gracePeriodOverride < minimumGracePeriodInSeconds {
 		min := int64(minimumGracePeriodInSeconds)
 		gracePeriodOverride = &min
 	}

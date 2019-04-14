@@ -629,6 +629,9 @@ func (m *kubeGenericRuntimeManager) killContainersWithSyncResult(pod *v1.Pod, ru
 	nonSidecarsWg.Wait()
 
 	gracePeriodDuration = gracePeriodDuration - time.Since(start)
+	if gracePeriodDuration < 0 {
+		gracePeriodDuration = 0
+	}
 
 	// then sidecars
 	glog.Infof("Pod: %s, killContainersWithSyncResult: killing %d sidecars, %s left", runningPod.Name, len(sidecars), gracePeriodDuration)
