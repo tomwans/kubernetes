@@ -894,8 +894,12 @@ func (m *kubeGenericRuntimeManager) KillPod(pod *v1.Pod, runningPod kubecontaine
 // killPodWithSyncResult kills a runningPod and returns SyncResult.
 // Note: The pod passed in could be *nil* when kubelet restarted.
 func (m *kubeGenericRuntimeManager) killPodWithSyncResult(pod *v1.Pod, runningPod kubecontainer.Pod, gracePeriodOverride *int64) (result kubecontainer.PodSyncResult) {
+	gracePeriodDuration := 0 * time.Second
+	if gracePeriodOverride != nil {
+		gracePeriodDuration = time.Duration(*gracePeriodOverride) * time.Second
+	}
 
-	killContainerResults := m.killContainersWithSyncResult(pod, runningPod, gracePeriodOverride)
+	killContainerResults := m.killContainersWithSyncResult(pod, runningPod, gracePeriodDuration)
 	for _, containerResult := range killContainerResults {
 		result.AddSyncResult(containerResult)
 	}
